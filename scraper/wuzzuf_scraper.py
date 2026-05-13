@@ -16,6 +16,8 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 import pandas as pd
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from parser import parse_all
+import json
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -279,3 +281,10 @@ if __name__ == "__main__":
     scraper = WuzzufScraper(headless=True)
     scraper.scrape()
     scraper.save()
+    with open("wuzzuf_ai_ml_jobs.json") as f:
+        raw_jobs = json.load(f)
+
+    parsed = parse_all(raw_jobs)
+
+    with open("wuzzuf_parsed_jobs.json", "w") as f:
+        json.dump(parsed, f, indent=2)

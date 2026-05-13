@@ -7,7 +7,13 @@ Install dependencies:
     playwright install chromium
 """
 
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import json
+import re
+import html as html_module
 import time
 import random
 import logging
@@ -16,8 +22,9 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 import pandas as pd
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
-from parser import parse_all
-import json
+from scraper.parser import parse_all
+from db.models import JobsDB
+from nlp.skill_extractor import enrich_all
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -96,13 +103,17 @@ class WuzzufScraper:
 
     def _get_job_links_from_page(self, page) -> list[str]:
         """Return all job detail URLs from a search results page."""
-        page.wait_for_selector("div.css-pkv5jc", timeout=15_000)   # job card container
-        cards = page.query_selector_all("h2.css-m604qf a")         # job title links
+        # Wait for any job detail link — /jobs/p/ is Wuzzuf's pattern for individual listings
+        page.wait_for_selector("a[href*='/jobs/p/']", timeout=15_000)
+        cards = page.query_selector_all("a[href*='/jobs/p/']")
+        seen = set()
         links = []
         for card in cards:
-            href = card.get_attribute("href")
-            if href:
-                links.append("https://wuzzuf.net" + href if href.startswith("/") else href)
+            href = card.get_attribute("href") or ""
+            if not href or href in seen:
+                continue
+            seen.add(href)
+            links.append("https://wuzzuf.net" + href if href.startswith("/") else href)
         return links
 
     def _build_search_url(self, query: str, page_num: int) -> str:
@@ -116,7 +127,7 @@ class WuzzufScraper:
         """Visit a job detail page and extract all fields."""
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-            page.wait_for_selector("h1.css-f4ls5e", timeout=10_000)
+            page.wait_for_selector("h1", timeout=10_000)
         except PlaywrightTimeout:
             log.warning(f"Timeout loading job page: {url}")
             return None
@@ -124,33 +135,119 @@ class WuzzufScraper:
             log.warning(f"Error loading {url}: {e}")
             return None
 
-        # ── Basic fields ──────────────────────────────────────────────────────
-        title    = self._safe_text(page, "h1.css-f4ls5e")
-        company  = self._safe_text(page, "a.css-17s97q8")
-        location = self._safe_text(page, "span.css-5wys0k")
+        # ── JSON-LD structured data ───────────────────────────────────────────────
+        ld_raw = page.evaluate("""() => {
+            const el = document.querySelector('script[type="application/ld+json"]');
+            try { return el ? JSON.parse(el.textContent) : {}; } catch(e) { return {}; }
+        }""") or {}
+        # JSON-LD may be a list; find the JobPosting entry
+        if isinstance(ld_raw, list):
+            ld = next((x for x in ld_raw if isinstance(x, dict) and "JobPosting" in str(x.get("@type", ""))), ld_raw[0] if ld_raw else {})
+        else:
+            ld = ld_raw if isinstance(ld_raw, dict) else {}
 
-        # ── Job criteria items (type, experience, level, salary) ──────────────
-        criteria_labels = self._safe_list(page, "div.css-1lh32fc span.css-4xky9y")
-        criteria_values = self._safe_list(page, "div.css-1lh32fc span.css-o171kl, div.css-1lh32fc a.css-o171kl")
+        def _strip_html(raw: str) -> str:
+            text = html_module.unescape(raw)
+            return re.sub(r"<[^>]+>", " ", text).strip()
 
-        criteria = dict(zip(criteria_labels, criteria_values))
+        def _ld(key, default="N/A"):
+            return ld.get(key) or default
 
-        job_type        = criteria.get("Job Type",       "N/A")
-        experience      = criteria.get("Years of Experience", "N/A")
-        career_level    = criteria.get("Career Level",   "N/A")
-        salary          = criteria.get("Salary",         "N/A")
+        if not ld:
+            log.warning(f"  No JSON-LD found on {url} — falling back to DOM for all fields")
 
-        # ── Dates ─────────────────────────────────────────────────────────────
-        posted_date = self._safe_text(page, "time")
-        deadline    = self._safe_text(page, "span.css-4c4ojb")
+        title = _ld("title") or self._safe_text(page, "h1")
 
-        # ── Description & Requirements ────────────────────────────────────────
-        description  = self._safe_text(page, "div.css-1uobp1k")
-        requirements = self._safe_text(page, "div.css-dtmqe8")
+        # company — JSON-LD first, then DOM link to /company/ page
+        _hiring = _ld("hiringOrganization", {})
+        company = (_hiring.get("name") if isinstance(_hiring, dict) else None) or \
+                  page.evaluate("""() => {
+                      for (const a of document.querySelectorAll('a[href*="/company/"]')) {
+                          const t = a.textContent.trim();
+                          if (t && t.length > 1) return t;
+                      }
+                      return null;
+                  }""") or "N/A"
 
-        # ── Skills tags ───────────────────────────────────────────────────────
-        skills     = self._safe_list(page, "a.css-b1l870")
-        categories = self._safe_list(page, "a.css-o171kl[href*='category']")
+        # location — try addressRegion then addressLocality then DOM
+        _addr = (_ld("jobLocation", {}) or {})
+        if isinstance(_addr, list):
+            _addr = _addr[0] if _addr else {}
+        _addr = (_addr.get("address") or {}) if isinstance(_addr, dict) else {}
+        location = (_addr.get("addressRegion") or _addr.get("addressLocality") or
+                    _addr.get("addressCountry")) or \
+                   page.evaluate("""() => {
+                       for (const a of document.querySelectorAll('a[href*="/jobs/in/"]')) {
+                           const t = a.textContent.trim();
+                           if (t) return t;
+                       }
+                       return 'N/A';
+                   }""") or "N/A"
+
+        job_type    = _ld("employmentType")
+        posted_date = _ld("datePosted")
+        deadline    = _ld("validThrough")
+        salary_obj  = _ld("baseSalary", {})
+        salary      = str(salary_obj.get("value") or salary_obj.get("currency") or "N/A") \
+                      if isinstance(salary_obj, dict) else "N/A"
+
+        raw_desc    = _ld("description", "")
+        desc_match  = re.search(r"Job Description</h1>(.*?)(?:<h1>|$)", raw_desc, re.DOTALL)
+        req_match   = re.search(r"Job Requirements</h1>(.*?)(?:<h1>|$)", raw_desc, re.DOTALL)
+        description  = _strip_html(desc_match.group(1)) if desc_match else _strip_html(raw_desc)
+        requirements = _strip_html(req_match.group(1)) if req_match else "N/A"
+
+        # ── Criteria (experience, career level) — text-based, survives CSS-in-JS renames ──
+        criteria: dict[str, str] = page.evaluate("""() => {
+            const result = {};
+            const targets = new Set(['Years of Experience', 'Career Level', 'Job Type', 'Salary Range']);
+            document.querySelectorAll('span, dt, li').forEach(el => {
+                const label = el.textContent.trim().replace(/:$/, '');
+                if (!targets.has(label)) return;
+                const parent = el.parentElement;
+                if (!parent) return;
+                const next = el.nextElementSibling;
+                let value = next ? next.textContent.trim() : '';
+                if (!value) {
+                    const children = Array.from(parent.children);
+                    const idx = children.indexOf(el);
+                    if (idx >= 0 && idx + 1 < children.length)
+                        value = children[idx + 1].textContent.trim();
+                }
+                if (value && !result[label]) result[label] = value;
+            });
+            return result;
+        }""") or {}
+
+        experience   = criteria.get("Years of Experience", "N/A")
+        career_level = criteria.get("Career Level", "N/A")
+
+        # ── Categories & Skills — URL-pattern based, no CSS class dependency ──
+        categories = page.evaluate("""() => {
+            const cats = new Set();
+            document.querySelectorAll('a[href*="category"]').forEach(a => {
+                const t = a.textContent.trim();
+                if (t && t.length < 60) cats.add(t);
+            });
+            return [...cats];
+        }""") or []
+
+        skills = page.evaluate("""() => {
+            // Wuzzuf skill tags link to /skill/ pages; fall back to skills-section spans
+            const byUrl = Array.from(document.querySelectorAll('a[href*="/skill/"]'))
+                               .map(a => a.textContent.trim()).filter(t => t);
+            if (byUrl.length) return byUrl;
+            const headers = Array.from(document.querySelectorAll('h2,h3,h4,h5,strong'));
+            const hdr = headers.find(h => /skills/i.test(h.textContent));
+            if (hdr) {
+                const container = hdr.closest('section') || hdr.parentElement;
+                if (container)
+                    return Array.from(container.querySelectorAll('a,span'))
+                               .map(el => el.textContent.trim())
+                               .filter(t => t.length > 1 && t.length < 40);
+            }
+            return [];
+        }""") or []
 
         return Job(
             title=title,
@@ -204,8 +301,12 @@ class WuzzufScraper:
                         log.warning("  Search page timed out, skipping.")
                         break
 
-                    # Check if results exist
-                    no_results = page.query_selector("div.css-1hfxbql")
+                    # Check if results exist — text-based, no CSS class dependency
+                    no_results = page.evaluate("""() => {
+                        const body = document.body.innerText || '';
+                        return /no (results|jobs) found/i.test(body) ||
+                               /didn.t find any/i.test(body);
+                    }""")
                     if no_results:
                         log.info("  No more results, stopping pagination.")
                         break
@@ -217,6 +318,9 @@ class WuzzufScraper:
                         break
 
                     log.info(f"  Found {len(job_links)} jobs on this page.")
+                    if not job_links:
+                        log.warning("  0 links found — Wuzzuf page structure may have changed or bot-detection triggered.")
+                        break
 
                     for link in job_links:
                         if link in seen_urls:
@@ -229,7 +333,7 @@ class WuzzufScraper:
 
                         if job:
                             self.jobs.append(job)
-                            log.info(f"  ✓ {job.title} @ {job.company}")
+                            log.info(f"  [OK] {job.title} @ {job.company}")
 
                         self._random_delay()
 
@@ -278,13 +382,27 @@ class WuzzufScraper:
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # 1. Scrape and save raw JSON
     scraper = WuzzufScraper(headless=True)
     scraper.scrape()
-    scraper.save()
-    with open("wuzzuf_ai_ml_jobs.json") as f:
-        raw_jobs = json.load(f)
+    scraper.save()  # ← creates wuzzuf_ai_ml_jobs.json
 
-    parsed = parse_all(raw_jobs)
+    # 2. Load raw JSON and parse it
+    if not scraper.jobs:
+        log.warning("No jobs were scraped — skipping parse and DB insert.")
+    else:
+        with open("wuzzuf_ai_ml_jobs.json") as f:
+            raw_jobs = json.load(f)
 
-    with open("wuzzuf_parsed_jobs.json", "w") as f:
-        json.dump(parsed, f, indent=2)
+        parsed = parse_all(raw_jobs)
+        parsed = enrich_all(parsed) 
+
+        # 3. Save parsed version
+        with open("wuzzuf_parsed_jobs.json", "w") as f:
+            json.dump(parsed, f, indent=2)
+
+        # 4. Insert into MongoDB
+        with JobsDB() as db:
+            result = db.insert_jobs(parsed)
+            db.log_scrape_run(**result, queries=SEARCH_QUERIES)
+            print(db.get_stats())

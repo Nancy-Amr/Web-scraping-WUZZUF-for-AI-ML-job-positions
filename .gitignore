@@ -1,0 +1,29 @@
+# ── Credentials & secrets ─────────────────────────────────────────────────────
+.env
+*.env.*
+!.env.example
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# ── Scraper output (large + potentially sensitive) ────────────────────────────
+*.log
+*.csv
+wuzzuf_ai_ml_jobs.json
+wuzzuf_parsed_jobs.json
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

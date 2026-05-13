@@ -156,15 +156,28 @@ class WuzzufScraper:
         if not ld:
             log.warning(f"  No JSON-LD found on {url} — falling back to DOM for all fields")
 
-        title = _ld("title") or self._safe_text(page, "h1")
+        title = (ld.get("title") or None) or self._safe_text(page, "h1")
 
-        # company — JSON-LD first, then DOM link to /company/ page
-        _hiring = _ld("hiringOrganization", {})
+        # company — JSON-LD first, then DOM link, then og:title / page title parsing
+        _hiring = ld.get("hiringOrganization") or {}
         company = (_hiring.get("name") if isinstance(_hiring, dict) else None) or \
                   page.evaluate("""() => {
-                      for (const a of document.querySelectorAll('a[href*="/company/"]')) {
+                      // 1. Company link (various Wuzzuf URL patterns)
+                      for (const a of document.querySelectorAll('a[href*="/company/"], a[href*="/companies/"]')) {
                           const t = a.textContent.trim();
                           if (t && t.length > 1) return t;
+                      }
+                      // 2. og:title — Wuzzuf sets it to "Job Title at Company | Wuzzuf"
+                      const og = document.querySelector('meta[property="og:title"]');
+                      if (og) {
+                          const m = (og.getAttribute('content') || '').match(/\\bat\\s+(.+?)(?:\\s*[|\\-]|$)/i);
+                          if (m) return m[1].trim();
+                      }
+                      // 3. <title> tag — same pattern
+                      const titleEl = document.querySelector('title');
+                      if (titleEl) {
+                          const m = titleEl.textContent.match(/\\bat\\s+(.+?)(?:\\s*[|\\-]|$)/i);
+                          if (m) return m[1].trim();
                       }
                       return null;
                   }""") or "N/A"
